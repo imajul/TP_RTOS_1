@@ -18,6 +18,13 @@
 
 DEBUG_PRINT_ENABLE
 
+#define UP      1
+#define FALLING 2
+#define DOWN	3
+#define RISING  4
+
+#define ANTI_BOUNCE_TIME_MS 50
+
 /*=====[Definitions of extern global variables]==============================*/
 
 /*=====[Definitions of public global variables]==============================*/
@@ -27,6 +34,7 @@ typedef struct
 	rtcDS3231_t date;
 	Eeprom24C32_t eeprom24C32;
 	uint16_t eeprom_address;
+	xQueueHandle Cola_ISR;           // cola de mensajes para manejo de IRQ
 
 }rtc_eeprom_t;
 
@@ -36,7 +44,6 @@ SemaphoreHandle_t Mutex_uart;    //Mutex que protege a la UART de concurrencia
 SemaphoreHandle_t Mutex_rtc;     //Mutex que protege al modulo RTC de concurrencia
 SemaphoreHandle_t Mutex_eeprom;  //Mutex que protege al modulo EEPROM de concurrencia
 
-xQueueHandle Cola_ISR;           // cola de mensajes para manejo de IRQ
 xQueueHandle Cola_EEPROM;        // cola de mensajes para manejo de EEPROM
 
 /*=====[Definitions of private global variables]=============================*/
@@ -45,9 +52,9 @@ xQueueHandle Cola_EEPROM;        // cola de mensajes para manejo de EEPROM
 
 void My_IRQ_Init (void);
 
-void Read( void* taskParmPtr );
+void Read_task( void* taskParmPtr );
 
-void Write( void* taskParmPtr );
+void Write_task( void* taskParmPtr );
 
 int main( void )
 {
@@ -55,19 +62,19 @@ int main( void )
 	boardInit();
 	debugPrintConfigUart( UART_USB, 115200 );
 
-	My_IRQ_Init();
-
 	Mutex_uart = xSemaphoreCreateMutex();
 	Mutex_rtc= xSemaphoreCreateMutex();
 	Mutex_eeprom= xSemaphoreCreateMutex();
 
-	Cola_ISR = xQueueCreate(10,sizeof(gpioMap_t));
+	rtc_eeprom.Cola_ISR = xQueueCreate(10,sizeof(uint8_t));
 	Cola_EEPROM = xQueueCreate(10,sizeof(rtc_eeprom_t));
+
+	My_IRQ_Init();
 
 	i2cInit( I2C0, 100000 );
 	debugPrintlnString( "I2C initialization complete." );
 
-	RTC_Init(&rtc_eeprom.date);  // inicializo la estructura time con los registros horarios
+	RTC_Init(&rtc_eeprom.date);        // inicializo la estructura time con los registros horarios
 	debugPrintlnString( "RTC initialization complete." );
 
 	eeprom24C32Init( &rtc_eeprom.eeprom24C32, I2C0, 1, 1, 1, EEPROM24C32_PAGE_SIZE, EEPROM_32_K_BIT );  // inicializo la EEPROM
@@ -78,26 +85,11 @@ int main( void )
 
 	eeprom24C32WriteDate(&rtc_eeprom.eeprom24C32, &rtc_eeprom.eeprom_address, rtc_eeprom.date); // escribo la fecha inicial en la EEPROM
 
-	xTaskCreate(
-			Read,                     // Funcion de la tarea a ejecutar
-			(const char *)"Read_RTC",     // Nombre de la tarea como String amigable para el usuario
-			configMINIMAL_STACK_SIZE*2, // Cantidad de stack de la tarea
-			0,               			  // Parametros de tarea
-			tskIDLE_PRIORITY+1,         // Prioridad de la tarea
-			0                           // Puntero a la tarea creada en el sistema
-	);
+	xTaskCreate(Read_task, (const char *)"Read_RTC", configMINIMAL_STACK_SIZE*2, &rtc_eeprom, tskIDLE_PRIORITY+1, 0);
 
-	xTaskCreate(
-			Write,                     // Funcion de la tarea a ejecutar
-			(const char *)"Write_EEPROM",     // Nombre de la tarea como String amigable para el usuario
-			configMINIMAL_STACK_SIZE*2,		 // Cantidad de stack de la tarea
-			0,                 					// Parametros de tarea
-			tskIDLE_PRIORITY+1,         // Prioridad de la tarea
-			0                           // Puntero a la tarea creada en el sistema
-	);
+	xTaskCreate(Write_task,(const char *)"Write_EEPROM",configMINIMAL_STACK_SIZE*2, 0, tskIDLE_PRIORITY+1, 0);
 
 	vTaskStartScheduler();
-
 
 	while( true )
 	{
@@ -110,46 +102,87 @@ int main( void )
 	return 0;
 }
 
-void Read( void* taskParmPtr )
+void Read_task( void* taskParmPtr )
 {
-	gpioMap_t Pin;
-	rtc_eeprom_t rtc_eeprom;
+	uint8_t pin;
+	rtc_eeprom_t* rtc_eeprom_p;
+	rtc_eeprom_p = (rtc_eeprom_t*) taskParmPtr;
 
 	while (TRUE)
 	{
-		if (xQueueReceive(Cola_ISR, &Pin, portMAX_DELAY))         // Espero evento de Lectura completada
+		if (xQueueReceive(rtc_eeprom_p->Cola_ISR, &pin, portMAX_DELAY))               // Espero evento de Lectura completada
 		{
-			xSemaphoreTake( Mutex_uart, portMAX_DELAY);           // Proteccion de la UART
-			printf("Alarma recibida");
-			xSemaphoreGive( Mutex_uart );
+			if (pdFALSE == (xQueueReceive(rtc_eeprom_p->Cola_ISR, &pin, (ANTI_BOUNCE_TIME_MS / portTICK_RATE_MS))))
+			{
+				switch (pin)
+				{
+				case GPIO0:
+					xSemaphoreTake( Mutex_uart, portMAX_DELAY);                 // Proteccion de la UART
+					debugPrintlnString("Alarma de tiempo generada");
+					xSemaphoreGive( Mutex_uart );
+					break;
 
-			xSemaphoreTake( Mutex_rtc, portMAX_DELAY);            // Proteccion del RTC
-			rtc_eeprom.date = RTC_read_time( &rtc_eeprom.date, I2C0);   // Leo los registros del RTC
-			RTC_reset_alarm(&(rtc_eeprom.date), I2C0);			  // Reseteo alarma en el RTC
+				case TEC1:
+					xSemaphoreTake( Mutex_uart, portMAX_DELAY);                 // Proteccion de la UART
+					debugPrintlnString("Tecla presionada");
+					xSemaphoreGive( Mutex_uart );
+					break;
+				}
+			}
+
+			xSemaphoreTake( Mutex_rtc, portMAX_DELAY);                  // Proteccion del RTC
+			rtc_eeprom_p->date = RTC_read_time( &(rtc_eeprom_p->date), I2C0);   // Leo los registros del RTC
+			RTC_reset_alarm(&(rtc_eeprom_p->date), I2C0);			        // Reseteo alarma en el RTC
 			xSemaphoreGive( Mutex_rtc );
 
-			xQueueSend(Cola_EEPROM, &rtc_eeprom, portMAX_DELAY);
+			xQueueSend(Cola_EEPROM, rtc_eeprom_p, portMAX_DELAY);
 		}
 	}
 }
 
-void Write( void* taskParmPtr )
+void Write_task( void* taskParmPtr )
 {
-	gpioMap_t Pin;
+	uint8_t Pin;
 	rtc_eeprom_t rtc_eeprom;
+	uint8_t readedByte = 0;
 
 	while (TRUE)
 	{
-		if (xQueueReceive(Cola_EEPROM, &rtc_eeprom, portMAX_DELAY)) //Espero evento de Lectura completada
+		if (xQueueReceive(Cola_EEPROM, &rtc_eeprom, portMAX_DELAY)) //Espero evento de Lectura completada.
 		{
-			xSemaphoreTake( Mutex_uart, portMAX_DELAY);   // proteccion de la UART
-			printf("Lectura recibida. Temperatura = %c", rtc_eeprom.date.MSB_temp);
+			xSemaphoreTake( Mutex_uart, portMAX_DELAY);   // proteccion de la UART.
+			debugPrintHex( rtc_eeprom.date.hour,8 );   // imprimo la hora por UART
+			debugPrintString(":");
+			debugPrintHex( rtc_eeprom.date.min,8 );
+			debugPrintString(":");
+			debugPrintHex( rtc_eeprom.date.sec,8 );
+			debugPrintString("  ");
+			debugPrintHex( rtc_eeprom.date.mday,8 );
+			debugPrintString("/");
+			debugPrintHex( rtc_eeprom.date.month,8 );
+			debugPrintString("/");
+			debugPrintHex( rtc_eeprom.date.year,8 );
+			debugPrintString(" Temperatura = ");
+			debugPrintInt(rtc_eeprom.date.MSB_temp);
+			debugPrintString(".");
+			debugPrintInt(rtc_eeprom.date.LSB_temp);
+			debugPrintString("\r\n");
 			xSemaphoreGive( Mutex_uart );
 
-			xSemaphoreTake( Mutex_eeprom, portMAX_DELAY);  // proteccion del RTC
+			xSemaphoreTake( Mutex_eeprom, portMAX_DELAY);  // proteccion del RTC.
 			eeprom24C32WriteByte( &rtc_eeprom.eeprom24C32, rtc_eeprom.eeprom_address, rtc_eeprom.date.MSB_temp); // escribo la temperatura leida por I2C en la EEPROM
-			xSemaphoreGive( Mutex_eeprom );
+			eeprom24C32ReadRandom( &rtc_eeprom.eeprom24C32, rtc_eeprom.eeprom_address, &readedByte );  // leo la hora escrita e imprimo
+			debugPrintString( "Temperatura leida de EEPROM: " );
+			debugPrintInt( readedByte );
+			debugPrintString("\r\n");
+			debugPrintString("\r\n");
 
+			if(rtc_eeprom.eeprom_address == EEPROM24C32_LAST_MEMORY_ADDRESS) {    // si llego al ultimo registro de la EEPROM genero overflow de direccon
+				rtc_eeprom.eeprom_address = EEPROM24C32_FIRST_MEMORY_ADDRESS;
+			} else {
+				rtc_eeprom.eeprom_address++;
+			}
+			xSemaphoreGive( Mutex_eeprom );
 		}
 	}
 }
@@ -161,49 +194,42 @@ void GPIO0_IRQHandler(void)
 	if (Chip_PININT_GetFallStates(LPC_GPIO_PIN_INT) & PININTCH0) // Verificamos que la interrupción es la esperada
 	{
 		Chip_PININT_ClearIntStatus(LPC_GPIO_PIN_INT, PININTCH0); // Borramos el flag de interrupción
-		gpioMap_t Pin = GPIO1;
-		xQueueSendFromISR(Cola_ISR, &Pin, &xHigherPriorityTaskWoken);
+		uint8_t pin = GPIO0;
+		xQueueSendFromISR(rtc_eeprom.Cola_ISR, &pin, &xHigherPriorityTaskWoken);
 	}
 
 	portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
 }
 
-void GPIO2_IRQHandler(void)
+void GPIO1_IRQHandler(void)
 {
 	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-	if (Chip_PININT_GetFallStates(LPC_GPIO_PIN_INT) & PININTCH2)  //Verificamos que la interrupción es la esperada
+	if (Chip_PININT_GetFallStates(LPC_GPIO_PIN_INT) & PININTCH1)  //Verificamos que la interrupción es la esperada
 	{
-		Chip_PININT_ClearIntStatus(LPC_GPIO_PIN_INT, PININTCH2); //Borramos el flag de interrupción
-		gpioMap_t Pin = TEC1;
-		xQueueSendFromISR(Cola_ISR, &Pin, &xHigherPriorityTaskWoken);
+		Chip_PININT_ClearIntStatus(LPC_GPIO_PIN_INT, PININTCH1); //Borramos el flag de interrupción
+		uint8_t pin = TEC1;
+		xQueueSendFromISR(rtc_eeprom.Cola_ISR, &pin, &xHigherPriorityTaskWoken);
 	}
 
 	portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
 }
 
-//Función de inicialización de IRQs
 void My_IRQ_Init (void)
 {
-	//Inicializamos las interrupciones (LPCopen)
 	Chip_PININT_Init(LPC_GPIO_PIN_INT);
 
-	//Inicializamos de cada evento de interrupción (LPCopen)
-	Chip_SCU_GPIOIntPinSel(0, 0, 4); //Mapeo del pin donde ocurrirá el evento y el canal al que lo va a enviar. (Canal 0 a 7, Puerto GPIO, Pin GPIO)
-	// pin correspondiente a la tecla TEC1
-	Chip_PININT_SetPinModeEdge(LPC_GPIO_PIN_INT, PININTCH0);//Se configura el canal para que se active por flanco
-	Chip_PININT_EnableIntLow(LPC_GPIO_PIN_INT, PININTCH0);//Se configura para que el flanco sea el de bajada
+	Chip_SCU_GPIOIntPinSel(0, 3, 0);  // Canal 0, Puerto 3, Pin 0 correspondiente al pin GPIO0 de la EDU-CIAA
+	Chip_PININT_SetPinModeEdge(LPC_GPIO_PIN_INT, PININTCH0);
+	Chip_PININT_EnableIntLow(LPC_GPIO_PIN_INT, PININTCH0);
 
-	Chip_SCU_GPIOIntPinSel(1, 3, 3);//En este caso el canal de interrupción es 1
-	// pin correspondiente al GPIO1 de la EDU-CIAA
+	Chip_SCU_GPIOIntPinSel(1, 0, 4);  // Canal 1, Puerto 0, Pin 4 correspondiente a la TEC1 de la EDU-CIAA
 	Chip_PININT_SetPinModeEdge(LPC_GPIO_PIN_INT, PININTCH1);
-	Chip_PININT_EnableIntLow(LPC_GPIO_PIN_INT, PININTCH1);//Se configura para que el flanco sea el de bajada
+	Chip_PININT_EnableIntLow(LPC_GPIO_PIN_INT, PININTCH1);
 
-	//Una vez que se han configurado los eventos para cada canal de interrupcion
-	//Se activan las interrupciones para que comiencen a llamar al handler
-	NVIC_SetPriority(PIN_INT0_IRQn, 8);
+	NVIC_SetPriority(PIN_INT0_IRQn, configMAX_SYSCALL_INTERRUPT_PRIORITY-1);
 	NVIC_EnableIRQ(PIN_INT0_IRQn);
-	NVIC_SetPriority(PIN_INT1_IRQn, 8);
+	NVIC_SetPriority(PIN_INT1_IRQn, configMAX_SYSCALL_INTERRUPT_PRIORITY-2);
 	NVIC_EnableIRQ(PIN_INT1_IRQn);
 
 }
